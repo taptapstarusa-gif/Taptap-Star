@@ -174,22 +174,41 @@ export type NotifyResult = { id: string; sent: boolean };
  * error, or thrown exception). Every existing call site was already fire-and-forget (`await
  * notify(...)` with the return value discarded), so this is safe to add without touching them;
  * only signup/resend-verification need `sent` to avoid showing a false "email sent" message.
+ *
+ * The leading insert() below used to sit OUTSIDE this function's own try/catch — a real bug
+ * (client report, Sept 2026): a device activation on a mobile connection threw a generic server
+ * error because this insert failed (most likely a Neon cold-start `fetch failed`, same root
+ * cause as app/api/devices/[id]/activate/route.ts's own withDbRetry hardening added alongside
+ * this fix), even though the activation UPDATE itself had already succeeded. That directly
+ * contradicted this function's own "never throws" contract above. Now covered by the same
+ * try/catch as everything else, so a logging failure can never take down the real action that
+ * triggered the notification.
  */
 export async function notify(
   accountId: string,
   type: NotificationType,
   payload: Payload = {}
 ): Promise<NotifyResult> {
-  const [event] = await db
-    .insert(notificationEvents)
-    .values({ accountId, type, payloadJson: payload })
-    .returning();
+  let eventId: string;
+  try {
+    const [event] = await db
+      .insert(notificationEvents)
+      .values({ accountId, type, payloadJson: payload })
+      .returning();
+    eventId = event.id;
+  } catch (err) {
+    // No event row exists to reference — this is the one case with no real id to return. Logged
+    // loudly since it means notification_events (the audit trail Step 9 relies on) missed a real
+    // event entirely, but the caller's own action must proceed regardless.
+    console.error(`[notify] failed to record event for type ${type}, account ${accountId}:`, err);
+    return { id: "", sent: false };
+  }
 
   try {
     const to = await resolveRecipient(accountId, payload);
     if (!to) {
       console.error(`[notify] no recipient resolved for account ${accountId}, type ${type}`);
-      return { id: event.id, sent: false };
+      return { id: eventId, sent: false };
     }
 
     const { subject, react } = render(type, payload);
@@ -204,17 +223,17 @@ export async function notify(
 
     if (error) {
       console.error(`[notify] send failed for type ${type}:`, error);
-      return { id: event.id, sent: false };
+      return { id: eventId, sent: false };
     }
 
     await db
       .update(notificationEvents)
       .set({ sentAt: new Date() })
-      .where(eq(notificationEvents.id, event.id));
+      .where(eq(notificationEvents.id, eventId));
   } catch (err) {
     console.error(`[notify] unexpected error sending type ${type}:`, err);
-    return { id: event.id, sent: false };
+    return { id: eventId, sent: false };
   }
 
-  return { id: event.id, sent: true };
+  return { id: eventId, sent: true };
 }

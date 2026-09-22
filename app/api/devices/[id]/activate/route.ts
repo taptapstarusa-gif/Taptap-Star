@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { and, eq, sql } from "drizzle-orm";
 import { db } from "@/lib/db/client";
+import { withDbRetry } from "@/lib/db/retry";
 import { devices, locations, employees, accounts } from "@/lib/db/schema";
 import { requireSession, requireActiveAccount, authErrorResponse, AuthError } from "@/lib/auth/rbac";
 import { activateDeviceSchema } from "@/lib/validation";
@@ -29,7 +30,16 @@ export async function POST(
       );
     }
 
-    const device = await db.query.devices.findFirst({ where: eq(devices.id, id) });
+    // Client reported (Sept 2026): activation failed with a generic server error on an Android
+    // phone, worked fine moments later from a computer — the classic signature of Neon's
+    // serverless compute failing a cold first request (`fetch failed`) on a slower/higher-latency
+    // mobile connection. This whole route previously had zero retry protection, unlike
+    // GET /api/locations's own read (lib/db/retry.ts's doc comment). withDbRetry wraps only the
+    // read-only lookups below — never the mutating UPDATE further down, which has its own
+    // deliberately-safe-to-retry reasoning at its own call site instead.
+    const device = await withDbRetry("POST /api/devices/[id]/activate device lookup", () =>
+      db.query.devices.findFirst({ where: eq(devices.id, id) })
+    );
     if (!device) {
       return NextResponse.json({ message: "Device not found" }, { status: 404 });
     }
@@ -40,9 +50,9 @@ export async function POST(
       );
     }
 
-    const location = await db.query.locations.findFirst({
-      where: eq(locations.id, parsed.data.locationId),
-    });
+    const location = await withDbRetry("POST /api/devices/[id]/activate location lookup", () =>
+      db.query.locations.findFirst({ where: eq(locations.id, parsed.data.locationId) })
+    );
     if (!location || location.accountId !== session.user.accountId) {
       throw new AuthError("Forbidden — location does not belong to your account", 403);
     }
@@ -53,18 +63,20 @@ export async function POST(
     // for every pre-existing account, mirroring app/api/locations/route.ts's exact pattern.
     // Enforced here at ACTIVATION, not at batch-create time — an unassigned device belongs to no
     // account yet and shouldn't count against anything.
-    const account = await db.query.accounts.findFirst({
-      where: eq(accounts.id, session.user.accountId),
-    });
+    const account = await withDbRetry("POST /api/devices/[id]/activate account lookup", () =>
+      db.query.accounts.findFirst({ where: eq(accounts.id, session.user.accountId) })
+    );
     if (!account) {
       return NextResponse.json({ message: "Account not found" }, { status: 404 });
     }
     const plan = await getPricingPlanByKey(account.planKey);
     if (plan.deviceLimit !== null) {
-      const [{ count }] = await db
-        .select({ count: sql<number>`count(*)::int` })
-        .from(devices)
-        .where(and(eq(devices.accountId, account.id), eq(devices.status, "active")));
+      const [{ count }] = await withDbRetry("POST /api/devices/[id]/activate device count", () =>
+        db
+          .select({ count: sql<number>`count(*)::int` })
+          .from(devices)
+          .where(and(eq(devices.accountId, account.id), eq(devices.status, "active")))
+      );
       if (count >= plan.deviceLimit) {
         return NextResponse.json(
           {
@@ -78,9 +90,10 @@ export async function POST(
     }
 
     if (parsed.data.employeeId) {
-      const employee = await db.query.employees.findFirst({
-        where: eq(employees.id, parsed.data.employeeId),
-      });
+      const employeeId = parsed.data.employeeId;
+      const employee = await withDbRetry("POST /api/devices/[id]/activate employee lookup", () =>
+        db.query.employees.findFirst({ where: eq(employees.id, employeeId) })
+      );
       // Employees are scoped to the location chosen in this same step — never account-wide
       // (architecture doc section 2's data-integrity rule).
       if (!employee || employee.locationId !== parsed.data.locationId) {
@@ -95,18 +108,28 @@ export async function POST(
     // check. The real guard is this UPDATE's WHERE also requiring status = 'unassigned': only one
     // concurrent request can match a row and get one back from `.returning()` — the other gets an
     // empty array and is treated as "already activated" below, exactly like the fast-path case.
-    const [updated] = await db
-      .update(devices)
-      .set({
-        status: "active",
-        accountId: session.user.accountId,
-        locationId: parsed.data.locationId,
-        employeeId: parsed.data.employeeId ?? null,
-        activatedAt: new Date(),
-        updatedAt: new Date(),
-      })
-      .where(and(eq(devices.id, id), eq(devices.status, "unassigned")))
-      .returning();
+    //
+    // withDbRetry is safe here specifically because of that same WHERE guard: if the first
+    // attempt's network round-trip genuinely failed before reaching the DB, retrying just
+    // performs the real update. If the first attempt actually succeeded server-side but the
+    // response never made it back (the exact mobile-network failure mode this route is being
+    // hardened against), the retry's WHERE no longer matches (status is already 'active') and it
+    // safely falls through to the same "already activated" 409 below — never a double-activation
+    // or a duplicate notify() call.
+    const [updated] = await withDbRetry("POST /api/devices/[id]/activate update", () =>
+      db
+        .update(devices)
+        .set({
+          status: "active",
+          accountId: session.user.accountId,
+          locationId: parsed.data.locationId,
+          employeeId: parsed.data.employeeId ?? null,
+          activatedAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(and(eq(devices.id, id), eq(devices.status, "unassigned")))
+        .returning()
+    );
 
     if (!updated) {
       return NextResponse.json(
